@@ -1,208 +1,246 @@
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from typing import List
+from pymongo.database import Database
 
 from ..database import get_db
-from ..models import User, Job, Application, Category, Skill, Tag
-from ..schemas import UserOut, UserCreate, UserUpdate, ContentItem, ContentCreate, ContentUpdate
+from ..models import to_oid
+from ..schemas import UserCreate, UserUpdate, ContentCreate, ContentUpdate
 from ..auth import require_role, hash_password
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 _admin = require_role("Admin")
 
 
-def _job_dict(j: Job) -> dict:
+def _user_out(u: dict) -> dict:
     return {
-        "id": j.id,
-        "title": j.title,
-        "company": j.company,
-        "type": j.type,
-        "status": j.status,
-        "applicants": len(j.applications),
-        "deadline": str(j.deadline) if j.deadline else None,
+        "id": str(u["_id"]),
+        "name": u["name"],
+        "email": u["email"],
+        "role": u["role"],
+        "status": u["status"],
     }
 
 
-# ── Dashboard ────────────────────────────────────────────────────────────────
+def _job_out(j: dict, db: Database) -> dict:
+    return {
+        "id": str(j["_id"]),
+        "title": j["title"],
+        "company": j["company"],
+        "type": j["type"],
+        "status": j["status"],
+        "applicants": db["applications"].count_documents({"job_id": j["_id"]}),
+        "deadline": str(j["deadline"]) if j.get("deadline") else None,
+    }
+
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
 
 @router.get("/dashboard")
-def dashboard(db: Session = Depends(get_db), _=Depends(_admin)):
+def dashboard(db: Database = Depends(get_db), _=Depends(_admin)):
     return {
-        "totalUsers":   db.query(User).filter(User.role != "Admin").count(),
-        "students":     db.query(User).filter(User.role == "Student").count(),
-        "recruiters":   db.query(User).filter(User.role == "Recruiter").count(),
-        "activeJobs":   db.query(Job).filter(Job.status.in_(["Approved", "Pending"])).count(),
-        "applications": db.query(Application).count(),
+        "totalUsers":   db["users"].count_documents({"role": {"$ne": "Admin"}}),
+        "students":     db["users"].count_documents({"role": "Student"}),
+        "recruiters":   db["users"].count_documents({"role": "Recruiter"}),
+        "activeJobs":   db["jobs"].count_documents({"status": {"$in": ["Approved", "Pending"]}}),
+        "applications": db["applications"].count_documents({}),
     }
 
 
-# ── Users ────────────────────────────────────────────────────────────────────
+# ── Users ─────────────────────────────────────────────────────────────────────
 
-@router.get("/users", response_model=List[UserOut])
-def list_users(db: Session = Depends(get_db), _=Depends(_admin)):
-    return db.query(User).all()
+@router.get("/users")
+def list_users(db: Database = Depends(get_db), _=Depends(_admin)):
+    return [_user_out(u) for u in db["users"].find()]
 
 
-@router.post("/users", response_model=UserOut, status_code=201)
-def create_user(payload: UserCreate, db: Session = Depends(get_db), _=Depends(_admin)):
-    if db.query(User).filter(User.email == payload.email).first():
+@router.post("/users", status_code=201)
+def create_user(payload: UserCreate, db: Database = Depends(get_db), _=Depends(_admin)):
+    if db["users"].find_one({"email": payload.email}):
         raise HTTPException(status_code=400, detail="Email already exists")
-    user = User(
-        name=payload.name,
-        email=payload.email,
-        password_hash=hash_password(payload.password or "Welcome@123"),
-        role=payload.role,
-        status=payload.status,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    user_doc = {
+        "name": payload.name,
+        "email": payload.email,
+        "password_hash": hash_password(payload.password or "Welcome@123"),
+        "role": payload.role,
+        "status": payload.status,
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = db["users"].insert_one(user_doc)
+    user_doc["_id"] = result.inserted_id
+    return _user_out(user_doc)
 
 
-@router.put("/users/{user_id}", response_model=UserOut)
-def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db), _=Depends(_admin)):
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
+@router.put("/users/{user_id}")
+def update_user(user_id: str, payload: UserUpdate, db: Database = Depends(get_db), _=Depends(_admin)):
+    oid = to_oid(user_id)
+    if oid is None:
         raise HTTPException(status_code=404, detail="User not found")
-    for k, v in payload.model_dump(exclude_none=True).items():
-        setattr(user, k, v)
-    db.commit()
-    db.refresh(user)
-    return user
+    updates = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    updates["updated_at"] = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    result = db["users"].find_one_and_update(
+        {"_id": oid},
+        {"$set": updates},
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="User not found")
+    return _user_out(result)
 
 
 @router.delete("/users/{user_id}")
-def delete_user(user_id: int, db: Session = Depends(get_db), _=Depends(_admin)):
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
+def delete_user(user_id: str, db: Database = Depends(get_db), _=Depends(_admin)):
+    oid = to_oid(user_id)
+    if oid is None:
         raise HTTPException(status_code=404, detail="User not found")
-    db.delete(user)
-    db.commit()
+    result = db["users"].delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
     return {"ok": True}
 
 
 # ── Jobs ─────────────────────────────────────────────────────────────────────
 
 @router.get("/jobs")
-def list_jobs(db: Session = Depends(get_db), _=Depends(_admin)):
-    return [_job_dict(j) for j in db.query(Job).all()]
+def list_jobs(db: Database = Depends(get_db), _=Depends(_admin)):
+    return [_job_out(j, db) for j in db["jobs"].find()]
 
 
 @router.put("/jobs/{job_id}")
-def update_job(job_id: int, payload: dict, db: Session = Depends(get_db), _=Depends(_admin)):
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
+def update_job(job_id: str, payload: dict, db: Database = Depends(get_db), _=Depends(_admin)):
+    oid = to_oid(job_id)
+    if oid is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    for field in ["title", "company", "type", "status"]:
-        if field in payload:
-            setattr(job, field, payload[field])
-    db.commit()
-    return _job_dict(job)
+    updates = {k: payload[k] for k in ["title", "company", "type", "status"] if k in payload}
+    result = db["jobs"].find_one_and_update(
+        {"_id": oid},
+        {"$set": updates},
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _job_out(result, db)
 
 
 @router.delete("/jobs/{job_id}")
-def delete_job(job_id: int, db: Session = Depends(get_db), _=Depends(_admin)):
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
+def delete_job(job_id: str, db: Database = Depends(get_db), _=Depends(_admin)):
+    oid = to_oid(job_id)
+    if oid is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    db.delete(job)
-    db.commit()
+    result = db["jobs"].delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Job not found")
     return {"ok": True}
 
 
 @router.patch("/jobs/{job_id}/approve")
-def approve_job(job_id: int, db: Session = Depends(get_db), _=Depends(_admin)):
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
+def approve_job(job_id: str, db: Database = Depends(get_db), _=Depends(_admin)):
+    oid = to_oid(job_id)
+    if oid is None:
         raise HTTPException(status_code=404, detail="Not found")
-    job.status = "Approved"
-    db.commit()
-    return _job_dict(job)
+    result = db["jobs"].find_one_and_update(
+        {"_id": oid},
+        {"$set": {"status": "Approved"}},
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _job_out(result, db)
 
 
 @router.patch("/jobs/{job_id}/reject")
-def reject_job(job_id: int, db: Session = Depends(get_db), _=Depends(_admin)):
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
+def reject_job(job_id: str, db: Database = Depends(get_db), _=Depends(_admin)):
+    oid = to_oid(job_id)
+    if oid is None:
         raise HTTPException(status_code=404, detail="Not found")
-    job.status = "Rejected"
-    db.commit()
-    return _job_dict(job)
+    result = db["jobs"].find_one_and_update(
+        {"_id": oid},
+        {"$set": {"status": "Rejected"}},
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _job_out(result, db)
 
 
 # ── Applications ─────────────────────────────────────────────────────────────
 
 @router.get("/applications")
-def list_applications(db: Session = Depends(get_db), _=Depends(_admin)):
-    return [
-        {
-            "id": a.id,
-            "student": a.student.name,
-            "job": a.job.title,
-            "company": a.job.company,
-            "status": a.status,
-        }
-        for a in db.query(Application).all()
-    ]
+def list_applications(db: Database = Depends(get_db), _=Depends(_admin)):
+    result = []
+    for a in db["applications"].find():
+        student = db["users"].find_one({"_id": a["student_id"]})
+        job     = db["jobs"].find_one({"_id": a["job_id"]})
+        result.append({
+            "id":      str(a["_id"]),
+            "student": student["name"] if student else "",
+            "job":     job["title"]    if job else "",
+            "company": job["company"]  if job else "",
+            "status":  a["status"],
+        })
+    return result
 
 
 # ── Content (categories + skills + tags) ─────────────────────────────────────
 
-@router.get("/content", response_model=List[ContentItem])
-def list_content(db: Session = Depends(get_db), _=Depends(_admin)):
+_COLL_MAP = {"Category": "categories", "Skill": "skills", "Tag": "tags"}
+
+
+@router.get("/content")
+def list_content(db: Database = Depends(get_db), _=Depends(_admin)):
     items = []
-    for c in db.query(Category).all():
-        items.append({"id": c.id, "type": "Category", "name": c.name})
-    for s in db.query(Skill).all():
-        items.append({"id": s.id, "type": "Skill", "name": s.name})
-    for t in db.query(Tag).all():
-        items.append({"id": t.id, "type": "Tag", "name": t.name})
+    for type_name, coll in _COLL_MAP.items():
+        for item in db[coll].find():
+            items.append({"id": str(item["_id"]), "type": type_name, "name": item["name"]})
     return items
 
 
-@router.post("/content", response_model=ContentItem, status_code=201)
-def create_content(payload: ContentCreate, db: Session = Depends(get_db), _=Depends(_admin)):
-    model_map = {"Category": Category, "Skill": Skill, "Tag": Tag}
-    model = model_map.get(payload.type)
-    if not model:
+@router.post("/content", status_code=201)
+def create_content(payload: ContentCreate, db: Database = Depends(get_db), _=Depends(_admin)):
+    coll = _COLL_MAP.get(payload.type)
+    if not coll:
         raise HTTPException(status_code=400, detail="Invalid type")
-    item = model(name=payload.name)
-    db.add(item)
-    db.commit()
-    db.refresh(item)
-    return {"id": item.id, "type": payload.type, "name": item.name}
+    result = db[coll].insert_one({"name": payload.name})
+    return {"id": str(result.inserted_id), "type": payload.type, "name": payload.name}
 
 
-@router.put("/content/{content_type}/{item_id}", response_model=ContentItem)
+@router.put("/content/{content_type}/{item_id}")
 def update_content(
-    content_type: str, item_id: int, payload: ContentUpdate,
-    db: Session = Depends(get_db), _=Depends(_admin),
+    content_type: str, item_id: str, payload: ContentUpdate,
+    db: Database = Depends(get_db), _=Depends(_admin),
 ):
-    model_map = {"Category": Category, "Skill": Skill, "Tag": Tag}
-    model = model_map.get(content_type)
-    if not model:
+    coll = _COLL_MAP.get(content_type)
+    if not coll:
         raise HTTPException(status_code=400, detail="Invalid content type")
-    item = db.query(model).filter(model.id == item_id).first()
-    if not item:
+    oid = to_oid(item_id)
+    if oid is None:
         raise HTTPException(status_code=404, detail="Not found")
-    item.name = payload.name
-    db.commit()
-    return {"id": item.id, "type": content_type, "name": item.name}
+    result = db[coll].find_one_and_update(
+        {"_id": oid},
+        {"$set": {"name": payload.name}},
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"id": str(result["_id"]), "type": content_type, "name": result["name"]}
 
 
 @router.delete("/content/{content_type}/{item_id}")
 def delete_content(
-    content_type: str, item_id: int,
-    db: Session = Depends(get_db), _=Depends(_admin),
+    content_type: str, item_id: str,
+    db: Database = Depends(get_db), _=Depends(_admin),
 ):
-    model_map = {"Category": Category, "Skill": Skill, "Tag": Tag}
-    model = model_map.get(content_type)
-    if not model:
+    coll = _COLL_MAP.get(content_type)
+    if not coll:
         raise HTTPException(status_code=400, detail="Invalid content type")
-    item = db.query(model).filter(model.id == item_id).first()
-    if not item:
+    oid = to_oid(item_id)
+    if oid is None:
         raise HTTPException(status_code=404, detail="Not found")
-    db.delete(item)
-    db.commit()
+    result = db[coll].delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Not found")
     return {"ok": True}

@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Optional
 from pydantic import BaseModel
 
 
@@ -15,7 +15,7 @@ class RegisterRequest(BaseModel):
     role: str
 
 class UserInfo(BaseModel):
-    id: int
+    id: str
     name: str
     email: str
     role: str
@@ -29,12 +29,11 @@ class TokenResponse(BaseModel):
 # ── Users ─────────────────────────────────────────────────────────────────────
 
 class UserOut(BaseModel):
-    id: int
+    id: str
     name: str
     email: str
     role: str
     status: str
-    model_config = {"from_attributes": True}
 
 class UserCreate(BaseModel):
     name: str
@@ -53,20 +52,18 @@ class UserUpdate(BaseModel):
 # ── Jobs ──────────────────────────────────────────────────────────────────────
 
 class JobOut(BaseModel):
-    id: int
+    id: str
     title: str
     company: str
     type: str
     status: str
     applicants: int = 0
     deadline: Optional[str] = None
-    model_config = {"from_attributes": True}
 
 class JobCreate(BaseModel):
     title: str
     company: str
     type: str = "Full-time"
-    status: str = "Pending"
     skills: Optional[str] = None
     description: Optional[str] = None
     location: Optional[str] = None
@@ -78,13 +75,12 @@ class JobUpdate(BaseModel):
     company: Optional[str] = None
     type: Optional[str] = None
     status: Optional[str] = None
-    applicants: Optional[int] = None
 
 
 # ── Content ───────────────────────────────────────────────────────────────────
 
 class ContentItem(BaseModel):
-    id: int
+    id: str
     type: str
     name: str
 
